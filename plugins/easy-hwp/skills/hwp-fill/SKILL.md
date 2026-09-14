@@ -8,229 +8,179 @@ description: 한글 서식(.hwp, .hwpx)에 내용을 채웁니다. "서식 채�
 ## 입력
 $ARGUMENTS
 
-## OS별 처리 방법
+---
 
-### Windows: pyhwpx 사용 (권장)
+## ⚠️ 가장 먼저 읽을 것 — 글자 겹침의 진짜 원인
 
-Windows + 한글 프로그램이 설치된 환경에서는 pyhwpx를 사용합니다.
+hwpx의 모든 `<hp:p>`에는 `<hp:linesegarray>`가 붙어 있다. **각 줄을 세로 몇 번째 좌표에 그릴지 적어둔 레이아웃 캐시**다.
+
+문단을 복제해서 내용을 채우면 이 캐시까지 복사된다. 그러면 새로 만든 10줄이 전부 `vertpos=1000` 같은 **똑같은 좌표**를 갖게 되고, 한글은 그 값을 그대로 믿고 **한 자리에 전부 포개서 그린다.** 화면에는 글자가 뭉개져 보인다.
+
+한 줄짜리 텍스트도 칸이 좁아 두 줄로 접혀야 하는데 캐시에 줄 정보가 1개뿐이면 같은 증상이 난다.
+
+**한글은 이 캐시를 자동으로 재계산하지 않는다.** 파일을 열었다가 `save_as`로 다시 저장해도 안 고쳐진다.
+
+### 해결책 — 저장 직전에 linesegarray를 전부 제거한다
+
+```python
+HP = '{http://www.hancom.co.kr/hwpml/2011/paragraph}'
+for p in root.iter(HP + 'p'):
+    for ls in p.findall(HP + 'linesegarray'):
+        p.remove(ls)
+```
+
+캐시가 없으면 한글이 열 때 처음부터 다시 계산한다. 아래 `hwpx_edit` 모듈의 `save()`가 이걸 자동으로 한다.
+
+> **하지 말 것**: "한 문단을 35자 이하로 쪼개서 한 줄에 맞춘다"는 식의 대응. 증상만 가리는 틀린 처방이고, 문장이 부자연스럽게 끊기며 칸 폭이 조금만 달라져도 다시 깨진다.
+
+---
+
+## 권장 절차 — `hwpx_edit` 모듈 사용
+
+이 스킬 폴더에 검증된 헬퍼가 들어 있다: `hwpx_edit.py`
+
+스킬이 실행되면 **Base directory**가 안내된다. 그 경로를 `sys.path`에 넣고 import한다.
+(플러그인 설치 시 `~/.claude/plugins/.../skills/hwp-fill/`, 수동 설치 시 `~/.claude/skills/hwp-fill/`)
+
+```python
+import sys
+sys.path.insert(0, SKILL_DIR)   # 스킬 Base directory
+from hwpx_edit import HwpxDoc
+
+doc = HwpxDoc.open(r'서식.hwpx')
+s0 = doc.section(0)
+s1 = doc.section(1)                    # 섹션이 여러 개인 서식도 있다
+
+# 셀 채우기 — (표index, col, row, 줄목록)
+s0.set_cell(0, 1, 0, ['AI 기반 의료영상 진단 시스템 개발'])
+s0.set_cell(0, 2, 1, ['① 첫 줄', '② 둘째 줄', '③ 셋째 줄'])
+
+# 안내문은 남기고 뒤에 덧붙이기
+s1.append_cell(1, 0, 1, ['', '■ 연구 배경', ' - 내용...'])
+
+# 표에 행 추가 (일정표 등)
+s1.clone_rows(9, src_row=2, n=9)
+
+doc.save(r'중간산출.hwpx')                        # linesegarray 자동 제거 + 재압축
+HwpxDoc.verify(r'중간산출.hwpx', r'최종.hwpx')     # 한글로 열고 재저장(레이아웃 재계산)
+print(HwpxDoc.check_layout(r'최종.hwpx'))          # []가 나와야 정상
+doc.close()
+```
+
+### 주요 API
+
+| 메서드 | 용도 |
+|--------|------|
+| `HwpxDoc.open(경로)` | 압축 해제 후 편집 세션 시작 |
+| `.section(i)` | i번째 섹션 편집기 |
+| `.save(경로)` | linesegarray 제거 + mimetype 무압축 선두 배치로 재압축 |
+| `.close()` | 임시 디렉토리 정리 |
+| `HwpxDoc.verify(src, dst)` | 한글로 열고 재저장 → 파싱 성공 확인 + 레이아웃 재생성 |
+| `HwpxDoc.check_layout(경로)` | 글자 겹침 검사. 빈 리스트면 정상 |
+| `sec.set_cell(t, c, r, lines)` | 셀 내용 교체 |
+| `sec.append_cell(t, c, r, lines)` | 셀 끝에 문단 추가 |
+| `sec.cell_text(t, c, r)` | 셀 전체 텍스트 읽기 |
+| `sec.clone_rows(t, src_row, n)` | 표 행 복제 추가 |
+| `sec.set_para(i, text)` / `.sub_para(i, 정규식, 치환)` / `.append_para(i, text)` | 표 밖 본문 문단 편집 |
+| `sec.check_boxes(키워드)` | 체크박스 채우기 |
+| `sec.replace_text(old, new)` | 전역 텍스트 치환 |
+
+---
+
+## 반드시 지킬 규칙
+
+### 1. 셀은 좌표(`cellAddr`)로 찾는다
+
+`<hp:tc>` 안의 `<hp:cellAddr colAddr="2" rowAddr="0"/>`가 진짜 주소다. 몇 번째 `<hp:tc>`인지로 세면 **병합셀 때문에 어긋난다**. 병합된 칸은 시작 좌표에만 셀이 존재하고 나머지 좌표는 아예 없다.
+
+반복 컬럼이 있는 표(분기별 일정표 등)는 채운 뒤 **행 단위로 덤프해서 정렬을 눈으로 확인**할 것. 사람이 세는 "3분기"와 `colAddr`가 한 칸씩 어긋나기 쉽다.
+
+### 2. 텍스트를 읽을 때 `.tail`까지 이어붙인다
+
+라벨에 `<hp:fwSpace/>`(균등분할 공백)가 섞여 있으면 `t.text`만 읽을 때 **첫 글자만** 나온다.
+
+```xml
+<hp:t>매<hp:fwSpace/><hp:fwSpace/>출<hp:fwSpace/>원가(-)</hp:t>
+```
+→ `t.text`는 `'매'`뿐. 자식 요소의 `.tail`을 모아야 `'매출원가(-)'`가 된다. `hwpx_edit.node_text()`가 처리해 준다.
+
+### 3. 서식은 기존 문단을 복제해서 보존한다
+
+새 `<hp:p>`를 맨손으로 만들면 폰트/정렬/들여쓰기가 다 깨진다. 그 칸에 이미 있는 빈 문단을 deepcopy해서 `<hp:t>`만 갈아끼운다.
+
+run이 여러 개면 **마지막 run**을 남긴다. 안내문 문단은 보통 `[들여쓰기용 작은 run, 본문 run]` 구조라 마지막 run이 본문 글자 스타일을 갖고 있다.
+
+### 4. 재압축 시 `mimetype`은 맨 앞 + 무압축
+
+```python
+zf.write(mimetype_path, 'mimetype', zipfile.ZIP_STORED)   # 먼저
+# 나머지 파일은 ZIP_DEFLATED
+```
+
+### 5. 네임스페이스 접두사를 유지한다
+
+파싱 전에 원본의 `xmlns:` 선언을 모두 `ET.register_namespace()`로 등록해야 한글이 읽는다. 안 하면 `ns0:` 같은 접두사로 바뀐다.
+
+### 6. 체크박스 문자
+
+| 상황 | 빈 칸 | 채운 칸 |
+|------|-------|---------|
+| 일반 텍스트 | `□` U+25A1 | `■` U+25A0 |
+| 한글 기호 폰트 | `\uf06f` | `\uf06e` |
+
+동의서처럼 같은 문구가 여러 번 나오면, **표를 품은 상위 문단은 건너뛰고** 말단 문단만 처리해야 중복 치환이 안 난다. 텍스트 노드가 쪼개져 있을 수 있으니 문단 전체 텍스트로 판정할 것.
+
+---
+
+## 검증 절차 (생략 금지)
+
+텍스트 대조만으로는 **겹침을 절대 못 잡는다.** 내용은 다 들어가 있는데 화면만 깨지기 때문이다.
+
+1. `doc.save()` → `HwpxDoc.verify()`로 한글에서 열리는지 확인
+2. `HwpxDoc.check_layout()`이 빈 리스트인지 확인 ← **이걸 꼭 해야 한다**
+3. 재저장본을 다시 풀어 셀 단위로 내용 대조
+4. 사용자에게 "직접 열어서 확인해 달라"고 안내
+
+`check_layout`은 한 칸 안에서 **연속한 두 줄의 `vertpos`가 같은지**를 본다. 값이 줄어드는 건 쪽이 넘어가며 좌표가 리셋된 정상 케이스라 단순 중복 집계로는 오탐이 난다.
+
+파일 크기도 신호다. 캐시를 제거하면 줄었다가, 한글이 재저장하면서 다시 커지면 재계산이 일어난 것.
+
+---
+
+## pyhwpx 직접 사용 (누름틀 필드가 있는 서식)
+
+서식에 "누름틀" 필드가 정의돼 있으면 XML을 건드릴 필요 없이 간단하다.
 
 ```python
 from pyhwpx import Hwp
-
-hwp = Hwp()
-hwp.open("서식.hwp")  # .hwp, .hwpx 모두 지원
-
-# 필드에 값 채우기
+hwp = Hwp(visible=False, new=False)
+hwp.open("서식.hwp")                    # .hwp, .hwpx 모두 지원
+print(hwp.get_field_list())             # 필드가 비어 있으면 XML 방식으로 전환
 hwp.put_field_text("연구과제명", "AI 기반 진단 시스템")
-hwp.put_field_text("연구책임자", "홍길동")
-
-# 저장
 hwp.save_as("결과.hwp")
 hwp.quit()
 ```
 
-**pyhwpx 설치**: `pip install pyhwpx`
+**요구 환경**: Windows + 한컴오피스 한글 설치 + `pip install pyhwpx`.
 
-**참고**: pyhwpx는 한글 문서의 "누름틀" 필드를 사용합니다. 서식에 누름틀이 없으면 표 셀을 직접 찾아서 수정해야 합니다.
+첫 실행 시 pyhwpx가 보안모듈 `FilePathCheckerModule.dll`을 `HKCU\SOFTWARE\HNC\HwpAutomation\Modules`에 자동 등록한다. 이게 없으면 파일을 열 때마다 보안 승인 팝업이 떠서 자동화가 멈춘다.
 
-### macOS/Linux: XML 직접 수정 (.hwpx만 지원)
+macOS/Linux에는 한글 프로그램이 없어 pyhwpx를 쓸 수 없다 → XML 편집 방식만 사용 가능(`.hwpx` 한정). 이때는 `verify()`를 건너뛰게 되는데, `save()`가 linesegarray를 제거해 두므로 사용자가 한글에서 처음 열 때 레이아웃이 계산된다.
 
-#### 처리 절차
-
-##### 1. HWPX 압축 해제
-
-```bash
-mkdir -p {임시디렉토리}
-unzip -o {서식}.hwpx -d {임시디렉토리}/
-```
-
-##### 2. 서식 파일 분석
-
-`{임시디렉토리}/Contents/section0.xml` 파일을 읽어서:
-- 표(`<hp:tbl>`) 찾기
-- 각 행의 첫 번째 셀에서 필드명 추출
-- 두 번째 셀이 비어있으면 채워야 할 항목
-
-##### 3. 내용 파악
-
-MD 파일 또는 사용자 제공 내용에서 필드-값 추출:
-```markdown
-# 연구과제명
-AI 기반 진단 시스템
-
-## 연구책임자
-홍길동
-```
-→ `{"연구과제명": "AI 기반 진단 시스템", "연구책임자": "홍길동"}`
-
-##### 4. 스마트 매칭
-
-필드명이 정확히 일치하지 않아도 **유연하게 매칭**:
-- `과제명` → `연구과제명` (부분 포함)
-- `책임자` → `연구책임자` (유사어)
-- `연구 기간` → `연구기간` (띄어쓰기 무시)
-
-**애매하면 반드시 사용자에게 확인**:
-- 여러 후보가 있을 때
-- 의미가 다를 수 있을 때
-- 매칭할 필드를 못 찾았을 때
-
-##### 5. 매칭 결과 확인
-
-사용자에게 매칭 결과를 보여주고 확인 받기:
-```
-매칭 결과:
-- 연구과제명 ← "AI 기반 진단 시스템"
-- 연구책임자 ← "홍길동"
-- 연구기간 ← (내용 없음)
-
-진행하시겠습니까?
-```
-
-##### 6. XML 수정
-
-Edit 도구를 사용하여 `section0.xml`의 해당 셀 내용을 수정:
-
-**수정 전**:
-```xml
-<hp:tc><hp:p><hp:t></hp:t></hp:p></hp:tc>
-```
-
-**수정 후**:
-```xml
-<hp:tc><hp:p><hp:t>홍길동</hp:t></hp:p></hp:tc>
-```
-
-주의: 빈 `<hp:t>` 태그나 `<hp:t/>` 를 찾아서 값을 채웁니다.
-
-##### 7. 재압축
-
-```bash
-cd {임시디렉토리}
-zip -r {출력파일}.hwpx *
-```
-
-**중요**: 압축 시 반드시 임시디렉토리 안에서 실행해야 합니다.
-
-##### 8. 정리
-
-```bash
-rm -rf {임시디렉토리}
-```
+`.hwp`(구형 바이너리)는 XML 편집이 불가능하므로 pyhwpx 경로만 쓸 수 있다.
 
 ---
 
-## 새 단락 삽입 (텍스트 추가 / 답안 작성)
+## 내용 매칭
 
-표 셀이 아닌 **본문에 새 단락을 삽입**할 때의 절차입니다.
+MD 등에서 필드-값을 뽑을 때 이름이 정확히 안 맞아도 유연하게 매칭한다 (`과제명`→`연구과제명`, 띄어쓰기 무시). 다만 후보가 여럿이거나 의미가 달라질 수 있으면 임의로 고르지 말고 확인할 것.
 
-### 6-A. 글자 색상(charPr) 추가
-
-`header.xml`의 `hh:charProperties`에 새 charPr을 추가합니다.
-
-```xml
-<!-- itemCnt 를 기존값+1 로 변경 -->
-<hh:charProperties itemCnt="9">
-  ...기존 charPr들...
-  <!-- 파란색(#0000FF) 추가: 기존 최대 id+1 사용 -->
-  <hh:charPr id="8" height="1000" textColor="#0000FF" shadeColor="none"
-    useFontSpace="0" useKerning="0" symMark="NONE" borderFillIDRef="2">
-    <hh:fontRef hangul="1" latin="1" hanja="1" japanese="1" other="1" symbol="1" user="1"/>
-    <hh:ratio hangul="100" latin="100" hanja="100" japanese="100" other="100" symbol="100" user="100"/>
-    <hh:spacing hangul="0" latin="0" hanja="0" japanese="0" other="0" symbol="0" user="0"/>
-    <hh:relSz hangul="100" latin="100" hanja="100" japanese="100" other="100" symbol="100" user="100"/>
-    <hh:offset hangul="0" latin="0" hanja="0" japanese="0" other="0" symbol="0" user="0"/>
-    <hh:underline type="NONE" shape="SOLID" color="#000000"/>
-    <hh:strikeout shape="NONE" color="#000000"/>
-    <hh:outline type="NONE"/>
-    <hh:shadow type="NONE" color="#C0C0C0" offsetX="10" offsetY="10"/>
-  </hh:charPr>
-</hh:charProperties>
-```
-
-### 6-B. 단락 XML 구조
-
-삽입할 단락의 기본 구조:
-
-```xml
-<hp:p id="2147483648" paraPrIDRef="0" styleIDRef="0" pageBreak="0" columnBreak="0" merged="0">
-  <hp:run charPrIDRef="8">
-    <hp:t>여기에 텍스트</hp:t>
-  </hp:run>
-  <hp:linesegarray>
-    <hp:lineseg textpos="0" vertpos="0" vertsize="1000" textheight="1000"
-      baseline="850" spacing="600" horzpos="0" horzsize="42520" flags="393216"/>
-  </hp:linesegarray>
-</hp:p>
-```
-
-### 6-C. ⚠️ lineseg 오버플로우 방지 — 반드시 준수
-
-`linesegarray`는 단락 내 각 **시각적 줄(line)**의 레이아웃 정보를 담습니다.
-삽입 시 lineseg를 **1개만** 사용하므로, 텍스트가 한 줄을 넘으면 한글 프로그램이 렌더링을 실패해 **글자가 깨집니다**.
-
-**규칙: 단락 하나에 한 줄에 들어오는 분량만 넣는다.**
-
-| 문자 종류 | 단락당 최대 글자 수 |
-|-----------|---------------------|
-| 한글 위주 | 35자 이하 |
-| 영문/숫자 위주 | 70자 이하 |
-| 한글+영문 혼합 | 40자 이하 |
-
-긴 문장은 반드시 여러 개의 `<hp:p>` 단락으로 분리합니다:
-
-```
-# 잘못된 예 (한 단락에 긴 문장 → 글자 깨짐)
-"이유: 무선 링크는 잡음, 페이딩, 간섭으로 비트 오류가 자주 발생한다. 상위 계층(TCP)의 재전송에만 의존하면 왕복 지연(RTT)이 크므로, PHY 레벨에서 FEC 등을 이용해 즉시 오류를 정정하는 것이 효율적이다."
-
-# 올바른 예 (35자 이하 단락으로 분리)
-"이유: 무선 링크는 잡음, 페이딩, 간섭으로"
-"오류가 자주 발생."
-"TCP 재전송만 의존 시 RTT 지연 큼."
-"PHY에서 FEC로 즉시 정정(local recovery)."
-```
-
-### 6-D. 삽입 위치 찾기 (PowerShell 예시)
-
-```powershell
-function Make-ColoredP {
-    param([string]$text, [int]$charPrId = 8)
-    return "<hp:p id=""2147483648"" paraPrIDRef=""0"" styleIDRef=""0"" pageBreak=""0"" columnBreak=""0"" merged=""0""><hp:run charPrIDRef=""$charPrId""><hp:t>$text</hp:t></hp:run><hp:linesegarray><hp:lineseg textpos=""0"" vertpos=""0"" vertsize=""1000"" textheight=""1000"" baseline=""850"" spacing=""600"" horzpos=""0"" horzsize=""42520"" flags=""393216""/></hp:linesegarray></hp:p>"
-}
-
-function Insert-After {
-    param([ref]$xmlRef, [string]$anchor, [string[]]$lines, [int]$charPrId = 8)
-    $idx = $xmlRef.Value.IndexOf("<hp:t>$anchor</hp:t>")
-    if ($idx -lt 0) { Write-Host "WARNING: 앵커 없음 -> $anchor"; return }
-    $closeIdx = $xmlRef.Value.IndexOf("</hp:p>", $idx) + "</hp:p>".Length
-    $insert = ($lines | ForEach-Object { Make-ColoredP $_ $charPrId }) -join ""
-    $xmlRef.Value = $xmlRef.Value.Substring(0, $closeIdx) + $insert + $xmlRef.Value.Substring($closeIdx)
-}
-
-# 사용 예: 앵커 텍스트 뒤에 파란색 단락 삽입
-# ※ 각 문자열은 반드시 35자(한글) / 70자(영문) 이하로 작성
-$xml = [System.IO.File]::ReadAllText($sectionPath, [System.Text.Encoding]::UTF8)
-Insert-After ([ref]$xml) "앵커 텍스트" @(
-    "짧은 줄 1 (35자 이하)",
-    "짧은 줄 2 (35자 이하)",
-    "짧은 줄 3"
-)
-$utf8NoBom = New-Object System.Text.UTF8Encoding $False
-[System.IO.File]::WriteAllText($sectionPath, $xml, $utf8NoBom)
-```
+사용자가 직접 채워야 하는 개인정보(휴대폰, 생년월일 등)는 **공란으로 두고 작업 끝에 한 번에 모아서 알려준다.** 중간에 멈춰 묻지 않는다.
 
 ---
 
 ## 출력
 
-- 기본 파일명: `{원본}_filled.hwpx` (또는 `.hwp`)
-- 사용자가 출력 파일명을 지정하면 해당 이름 사용
-- 채워진 필드, 못 채운 필드 알려주기
-
-## 주의사항
-
-- macOS/Linux에서 `.hwp`는 지원 안 됨 → 한글에서 `.hwpx`로 다시 저장하라고 안내
-- Windows에서는 pyhwpx로 `.hwp`, `.hwpx` 모두 지원
-- XML 특수문자 이스케이프: `&` → `&amp;`, `<` → `&lt;`, `>` → `&gt;`
-- **단락 삽입 시 한 단락 = 한 줄 분량** (lineseg 오버플로우 방지, 6-C 참고)
-- 원본 파일은 수정하지 않음 (새 파일 생성)
+- 기본 파일명: `{원본}_filled.hwpx`, 사용자가 지정하면 그 이름
+- 원본은 수정하지 않는다
+- 보고 시: 채운 항목 / 못 채운 항목 / **생성된 파일의 전체 경로**를 명시

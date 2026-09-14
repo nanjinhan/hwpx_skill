@@ -8,6 +8,10 @@
 .DS_Store
 Thumbs.db
 
+# Python
+__pycache__/
+*.py[cod]
+
 # 임시 파일
 *.tmp
 temp_*/
